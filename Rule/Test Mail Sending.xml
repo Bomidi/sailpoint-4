@@ -1,0 +1,62 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Rule PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<Rule language="beanshell" name="Test Email Sending">
+    <Description>Debugging Tool - Sends a sample email out via the email server.</Description>
+    <Source>
+        // Library inclusions for BeanShell
+        import sailpoint.api.*;
+        import sailpoint.object.*;
+        import sailpoint.tools.*;
+        import java.util.*;
+        import java.lang.*;
+        import java.text.*;
+        // Point this to the “To” email address
+        String emailDest = "tanmay.x.saha@gmail.com";
+        // Specify the email template name in tplName
+
+        String tplName = "Joiner Notification Email";
+        EmailTemplate template = context.getObjectByName(EmailTemplate.class, tplName);
+
+        if (null == template) {
+        log.error("ERROR: could not find email template [ " + tplName + "]");
+        return;
+        }
+        template = (EmailTemplate) template.deepCopy(context);
+        if (null == template) {
+        log.error("ERROR: failed to deepCopy template [ " + tplName + "]");
+        return;
+        }
+
+        String identityName="schuthari";
+
+        Identity joinerIdentity = (Identity) context.getObjectByName(Identity.class, identityName);
+
+        Map emailArguments = new HashMap();
+        boolean emailSent;
+
+        String WAM_IDENTITY_LOCATION = joinerIdentity.getAttribute("locationCode");
+
+        String lastHireDate = joinerIdentity.getAttribute("lastHireDate");
+        SimpleDateFormat dateFormatOriginal = new SimpleDateFormat("yyyy-MM-dd");
+        Date date = dateFormatOriginal.parse(lastHireDate);
+        SimpleDateFormat dateFormatEmail = new SimpleDateFormat("dd-MMM-yyyy");
+        String formattedDate = dateFormatEmail.format(date);
+
+        //Setting parameters for sendEmail() method
+        emailArguments.put("identityName", joinerIdentity.getDisplayName());
+        emailArguments.put("lastHireDate", formattedDate);
+        emailArguments.put("employeeID", joinerIdentity.getAttribute("empNo"));
+        emailArguments.put("ntLogon", joinerIdentity.getAttribute("ntLogon"));
+        emailArguments.put("email", joinerIdentity.getEmail());
+        emailArguments.put("jobTitle", joinerIdentity.getAttribute("jobTitle"));
+        emailArguments.put("deptName", joinerIdentity.getAttribute("deptDescription"));
+        emailArguments.put("subDeptName", joinerIdentity.getAttribute("subDeptDesc"));
+        emailArguments.put("location", IDENTITY_LOCATION);
+        emailArguments.put("employeeType", joinerIdentity.getAttribute("employeeType"));
+        emailArguments.put("managerName", joinerIdentity.getManager().getDisplayName());
+
+        EmailOptions ops = new EmailOptions(emailDest, emailArguments);
+        context.sendEmailNotification(template, ops);
+        return "Done";
+    </Source>
+</Rule>
