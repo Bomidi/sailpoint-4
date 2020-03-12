@@ -1,0 +1,281 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Rule PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+<Rule language="beanshell" name="SplitProvisioningRule">
+  <ReferencedRules>
+    <Reference class="sailpoint.object.Rule" name="Workflow Library"/>
+  </ReferencedRules>
+  <Source>
+    <![CDATA[
+{ // add braces to avoid polluting namespace and prevent error while re-declaring log variable with different type.
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+import org.apache.log4j.Logger;
+
+import sailpoint.api.ObjectUtil;
+import sailpoint.api.SailPointContext;
+import sailpoint.object.Application;
+import sailpoint.object.Attributes;
+import sailpoint.object.Identity;
+import sailpoint.object.ManagedAttribute;
+import sailpoint.object.ProvisioningPlan.AbstractRequest;
+import sailpoint.object.ProvisioningPlan.Operation;
+import sailpoint.object.ProvisioningProject;
+import sailpoint.object.ProvisioningPlan;
+import sailpoint.object.ProvisioningPlan.AccountRequest;
+import sailpoint.object.ProvisioningPlan.AttributeRequest;
+import sailpoint.object.IdentityRequest;
+import sailpoint.object.IdentityRequestItem;
+import sailpoint.object.Filter;
+import sailpoint.tools.GeneralException;
+import sailpoint.tools.Util;
+import sailpoint.workflow.WorkflowContext;
+
+import com.google.common.collect.LinkedListMultimap;
+import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Multimap;
+
+Logger log              = Logger.getLogger("com.rule.SplitProvisioningPlan");
+String AD_APPNAME       = "Active Directory";
+String AD_OWNER_COMPLEX = AD_APPNAME + ":" + "Complex";
+String AD_NO_OWNER      = AD_APPNAME + ":" + "No Owner";
+
+public String calculateEntitlementApprover(String entitlementName,
+        String applicationName, String requester) throws GeneralException {
+    log.trace("Enter calculateEntitlementOwner() ...");
+
+    // Code for Entitlement owner
+    Filter filter = Filter.and(Filter.eq("displayName", entitlementName),
+            Filter.eq("application.name", applicationName));
+    ManagedAttribute attribute = context.getUniqueObject(
+            ManagedAttribute.class, filter);
+    if (attribute == null) {
+        log.debug("Managed attribute " + entitlementName
+                + " not found. Returning approver null.");
+        return null;
+    }
+    Identity entitlementOwner = attribute.getOwner();
+    if (entitlementOwner == null) {
+        log.debug("Managed attribute " + entitlementName
+                + " has no owner. Returning approver null.");
+        return null;
+    }
+
+    String owner = entitlementOwner.getName();
+    if (entitlementOwner.isWorkgroup()) {
+        Identity requesterIdentity = (Identity) context.getObjectByName(
+                Identity.class, requester);
+
+        // check requesterIdentity is owner of the application
+        Filter filter2 = Filter.and(Filter.eq("name", applicationName),
+                ObjectUtil.getOwnerFilterForIdentity(requesterIdentity));
+        Application filterApplication = context.getUniqueObject(
+                Application.class, filter2);
+        if (filterApplication != null) {
+            log.debug("Requester " + requester
+                    + " is owner of application " + applicationName
+                    + ". Return approver null.");
+            return null;
+        }
+    } else if (owner.equals(requester)) {
+        log.debug("Requester " + requester + " is owner of entitlement "
+                + entitlementName + ". Return approver null.");
+        return null;
+    }
+
+    log.trace("Exit calculateEntitlementOwner() with approver " + owner);
+    return owner;
+}	
+
+/**
+* Split each of the attribute requests in the AccountRequest accReq into a map of list of AccountRequests.
+* Each entry in the map is given a name based on the "branch" to which the account request is to be sent.
+*/
+public Multimap splitADAccountRequest(AccountRequest accReq, String requester) throws GeneralException {
+    // Split AD account request by owner
+    // Categorize all account requests with more than one attribute
+    // request as "complex"
+    log.debug("Active Directory account requests to be split by owner.");
+    ListMultimap result = LinkedListMultimap.create();
+
+    if (log.isTraceEnabled()) log.trace("Processing " + accReq.toXml());
+    List<AttributeRequest> attrReqs = accReq.getAttributeRequests();
+    if (attrReqs.size() > 1) {
+        log.debug("Account request has more than one attribute request. Adding to complex category.");
+        result.get(AD_APPNAME + ":" + AD_OWNER_COMPLEX).add(accReq);
+    } else {
+        AttributeRequest attrReq = attrReqs.get(0);
+        if (attrReq.getOp() == Operation.Add) {
+            log.debug("Account request with one attribute request "
+                    + attrReq.getDisplayValue());
+            String owner = calculateEntitlementApprover(
+                    attrReq.getDisplayValue(),
+                    accReq.getApplicationName(), requester);
+            if (owner == null) {
+                log.debug("No approver required. Adding to no owner list.");
+                result.get(AD_NO_OWNER).add(accReq);
+            } else {
+                log.debug("Appending account request to owner list " + owner);
+                result.get(AD_APPNAME + ":" + owner).add(accReq);
+            }
+        } else {
+            log.debug("Account request with one attribute request of type "
+                    + attrReq.getOp()
+                    + ". Assuming no approval required.");
+            result.get(AD_NO_OWNER).add(accReq);
+        }
+    }
+    
+    return result;
+}
+
+/**
+* SplitProvisioningPlan returns a list of split plan on application name
+* 
+* 
+* @return List splitPlans
+* @throws GeneralException
+*/
+public List SplitProvisioningPlan() throws GeneralException {
+    log.info("Enter SplitProvisioningPlan method");
+    
+    ProvisioningProject provisioningProject = 
+            (ProvisioningProject) workflow.get("project");
+    String requester = (String) workflow.get("launcher");
+    String identityRequestId = (String) workflow.get("identityRequestId");
+    IdentityRequest identityRequest = null;
+    if (identityRequestId != null) {
+        identityRequest = (IdentityRequest) context.getObjectByName(
+            IdentityRequest.class, identityRequestId);
+    }
+    ProvisioningPlan masterPlan = provisioningProject.getMasterPlan();
+    String identityName = provisioningProject.getIdentity();
+
+    List splitPlans = new ArrayList();
+    ListMultimap splitAccReqs = LinkedListMultimap.create();
+
+    try {
+        if (provisioningProject == null) {
+            log.warn("No project passed into workflow.");
+            return splitPlans;
+        }
+        if (masterPlan == null) {
+            log.warn("No master plan in project.");
+            return splitPlans;
+        }
+        if (identityRequest == null) {
+            log.warn("No identity request found!");
+            return splitPlans;
+        }
+        for (AccountRequest accReq : masterPlan.getAccountRequests()) {
+            String appName = accReq.getApplicationName();
+            if (appName.equals("Active Directory")) {
+                splitAccReqs.putAll(splitADAccountRequest(accReq, requester));
+            }
+            else {
+                splitAccReqs.get(appName).add(accReq);
+            }
+        }
+
+        splitPlans = CreateSplitPlan(provisioningProject,
+                splitAccReqs, identityRequest, identityName,
+                requester);
+        return splitPlans;
+    }
+    finally {
+        log.info("Exit SplitProvisioningPlan method");
+    }
+}
+
+/**
+* CreateSplitPlan returns a list of split plan on application name
+* 
+* 
+* @return List splitPlans
+* @throws GeneralException
+*/
+public List CreateSplitPlan(
+        ProvisioningProject provisioningProject, ListMultimap splitAccReqs,
+        IdentityRequest identityRequest, String identityName,
+        String requester) throws GeneralException {
+    log.info("Enter CreateSplitPlan method");
+    List splitPlans = new ArrayList();
+    String trackingId = null;
+    ProvisioningPlan provisioningPlan = new ProvisioningPlan();
+
+    Identity identity = (Identity) context.getObject(Identity.class,
+            identityName);
+    for (Object branchNameObj : splitAccReqs.keySet()) {
+        String branchName = (String)branchNameObj;
+        List<AccountRequest> accReqs = (List)splitAccReqs.get(branchName);
+
+        log.debug("Creating plan for " + branchName);
+        provisioningPlan = new ProvisioningPlan();
+        provisioningPlan.setIdentity(identity);
+
+        // Set account request to application
+        provisioningPlan.setAccountRequests(accReqs);
+
+        // add identityRequestId argument to plan
+        Attributes attributes = new Attributes();
+        attributes.putClean("identityRequestId", identityRequest.getName());
+        attributes.putClean("splitBranch", branchName);
+        provisioningPlan.setArguments(attributes);
+
+        // Set questionHistory and provisioningTargets
+        provisioningPlan.setQuestionHistory(provisioningProject
+                .getQuestionHistory());
+        provisioningPlan.setProvisioningTargets(provisioningProject
+                .getProvisioningTargets());
+
+        // Generating and setting trackingId on the plan and
+        // identity request
+        trackingId = Util.uuid();
+        provisioningPlan.setRequestTrackingId(trackingId);
+        
+        // Get the set of all assignmentIds from
+        // AttributeRequests
+        Set<String> allAssignmentIds = new HashSet<String>();
+        for (AccountRequest accReq : accReqs) {
+            if( null != accReq.getAttributeRequests()){
+                for (AttributeRequest attReq : accReq.getAttributeRequests()) {
+                    allAssignmentIds.add(attReq.getAssignmentId());
+                }
+          }
+        }
+
+        // Update the appropriate identityRequestItems in the IdentityRequest with the trackingId
+        for (IdentityRequestItem identityRequestItem : Util.safeIterable(identityRequest.getItems())) {
+            String assignmentId = (String) identityRequestItem.getAttribute("assignmentId");
+            if (allAssignmentIds.contains(assignmentId)) {
+                identityRequestItem.setAttribute("trackingId", trackingId);
+            }
+        }
+
+        splitPlans.add(provisioningPlan);
+    }
+
+    context.saveObject(identityRequest);
+    context.commitTransaction();
+    log.info("Exit CreateSplitPlan method");
+    return splitPlans;
+}
+
+try {
+    log.info("Enter Split Provisioning Plan Rule");
+    //log.trace("Got project: " + workflow.get("project").toXml());
+    return SplitProvisioningPlan();
+} finally {
+    log.info("Exit Split Provisioning Plan Rule");
+}
+
+}
+    ]]>
+  </Source>
+</Rule>
